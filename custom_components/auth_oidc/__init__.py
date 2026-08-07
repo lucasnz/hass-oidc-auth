@@ -42,10 +42,12 @@ from .endpoints import (
     OIDCCallbackView,
     OIDCInjectedAuthPage,
     OIDCDeviceSSE,
+    OIDCMobileStatusView,
 )
 from .tools.oidc_client import OIDCClient
 from .tools.types import OIDCWelcomeOptions
 from .provider import OpenIDAuthProvider
+from .stores.mobile_session_store import MobileSessionStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -201,6 +203,8 @@ async def _setup_oidc_provider(hass: HomeAssistant, my_config: dict, display_nam
         ]
     )
 
+    mobile_sessions = MobileSessionStore()
+
     has_only_trusted_networks = (
         auth_provider_count == 1 and has_trusted_networks_provider_first
     )
@@ -217,8 +221,13 @@ async def _setup_oidc_provider(hass: HomeAssistant, my_config: dict, display_nam
         )
     )
     hass.http.register_view(OIDCDeviceSSE(provider))
-    hass.http.register_view(OIDCRedirectView(oidc_client, provider, force_https))
-    hass.http.register_view(OIDCCallbackView(oidc_client, provider, force_https))
+    hass.http.register_view(OIDCMobileStatusView(mobile_sessions))
+    hass.http.register_view(
+        OIDCRedirectView(oidc_client, provider, force_https, mobile_sessions)
+    )
+    hass.http.register_view(
+        OIDCCallbackView(oidc_client, provider, force_https, mobile_sessions)
+    )
     hass.http.register_view(OIDCFinishView(provider))
 
     _LOGGER.info("Registered OIDC views")

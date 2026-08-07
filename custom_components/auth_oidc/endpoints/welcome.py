@@ -2,11 +2,19 @@
 
 import base64
 import binascii
-from urllib.parse import urlparse, parse_qs, unquote, urlencode
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
+
 from aiohttp import web
 from homeassistant.components.http import HomeAssistantView
-from ..tools.helpers import error_response, get_url, template_response, concat_url_query
+
 from ..provider import OpenIDAuthProvider
+from ..tools.helpers import (
+    concat_url_query,
+    error_response,
+    get_url,
+    no_store_response,
+    template_response,
+)
 from ..tools.types import OIDCWelcomeOptions
 
 PATH = "/auth/oidc/welcome"
@@ -28,7 +36,7 @@ class OIDCWelcomeView(HomeAssistantView):
         self.has_other_auth_providers = options.get("has_other_auth_providers")
         self.prefers_skipping = options.get("prefers_skipping")
 
-    async def _process_url(self, redirect_uri: str) -> tuple[str, bool]:
+    async def _process_url(self, redirect_uri: str) -> tuple[str, str, bool]:
         """Processes the redirect URI to determine if we need setTokens and if this is mobile."""
         # decodeURIComponent(btoa(...)) -> unquote first, then base64 decode
         decoded_redirect_uri = base64.b64decode(
@@ -104,7 +112,9 @@ class OIDCWelcomeView(HomeAssistantView):
             is_mobile = False
 
         # Create OIDC state with the redirect_uri so we can use it later in the flow
-        state_id = await self.oidc_provider.async_create_state(redirect_uri)
+        state_id = await self.oidc_provider.async_create_state(
+            redirect_uri, is_mobile=is_mobile
+        )
         cookie_header = self.oidc_provider.get_cookie_header(
             state_id, secure=self.force_https or req.url.scheme == "https"
         )
@@ -119,31 +129,36 @@ class OIDCWelcomeView(HomeAssistantView):
                 headers=cookie_header,
             )
 
-        # Otherwise display the screen with either mobile sign in or the buttons
-        # First generate code if mobile
-        code = None
+        # Mobile clients first navigate the app WebView to /redirect. That page
+        # stays in the app while opening the actual IdP URL externally.
+        mobile_start_url = None
         if is_mobile:
-            # Create a code to login
-            code = await self.oidc_provider.async_generate_device_code(state_id)
-            if not code:
+            mobile_token = await self.oidc_provider.async_generate_mobile_handoff(
+                state_id
+            )
+            if not mobile_token:
                 return await error_response(
-                    "Failed to generate device code, please restart login.",
+                    "Failed to prepare mobile sign-in, please restart login.",
                     status=500,
                 )
+            mobile_start_url = get_url(
+                f"/auth/oidc/redirect?mobile_token={mobile_token}", self.force_https
+            )
 
         # And add the other link if we have other auth providers
         other_link = None
         if self.has_other_auth_providers:
             other_link = concat_url_query(other_return_url, "skip_oidc_redirect=true")
 
-        # And display
         response = await template_response(
             "welcome",
             {
                 "name": self.name,
                 "other_link": other_link,
-                "code": code,
+                "mobile_start_url": mobile_start_url,
             },
         )
         response.headers.update(cookie_header)
+        if is_mobile:
+            return no_store_response(response)
         return response
