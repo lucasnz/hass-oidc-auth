@@ -25,6 +25,15 @@ class OIDCDeviceSSE(HomeAssistantView):
         if not state_id:
             raise web.HTTPBadRequest(text="Missing session cookie")
 
+        # Mobile webviews are commonly suspended while the external browser is
+        # open. Provide a short one-shot status check so the app does not depend
+        # on a long-lived SSE connection surviving or reconnecting after resume.
+        if req.query.get("poll") == "1":
+            ready = await self.oidc_provider.async_is_state_ready(state_id)
+            return web.json_response(
+                {"ready": ready}, headers={"Cache-Control": "no-store"}
+            )
+
         timeout_seconds = 300
         started_at = asyncio.get_running_loop().time()
 

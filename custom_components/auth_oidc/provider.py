@@ -122,7 +122,7 @@ class OpenIDAuthProvider(AuthProvider):
             self._user_meta = {}
 
         # Listen for user creation events
-        self.hass.bus.async_listen(EVENT_USER_ADDED, self.async_user_created)
+        self.hass.bus.async_listen(EVENT_USER_ADDED, self._async_user_created)
 
     def _resolve_ip(self, ip: str | None = None) -> str | None:
         """Resolve client IP from explicit input or current request context."""
@@ -170,15 +170,41 @@ class OpenIDAuthProvider(AuthProvider):
             )
             return False
 
-    async def async_create_state(self, redirect_uri: str, ip: str | None = None) -> str:
+    async def async_create_state(
+        self, redirect_uri: str, ip: str | None = None, is_mobile: bool = False
+    ) -> str:
         """Create a new OIDC state and return the state id."""
         if self._state_store is None:
             await self.async_initialize()
             assert self._state_store is not None
 
         return await self._state_store.async_create_state_from_url(
-            redirect_uri, self._resolve_ip(ip)
+            redirect_uri, self._resolve_ip(ip), is_mobile=is_mobile
         )
+
+    async def async_generate_mobile_handoff(self, state_id: str) -> Optional[str]:
+        """Generate a one-time token to start sign-in in a mobile browser."""
+        if self._state_store is None:
+            await self.async_initialize()
+            assert self._state_store is not None
+
+        return await self._state_store.async_generate_mobile_handoff_for_state(state_id)
+
+    async def async_claim_mobile_handoff(self, token: str) -> Optional[str]:
+        """Claim a one-time mobile browser handoff token."""
+        if self._state_store is None:
+            await self.async_initialize()
+            assert self._state_store is not None
+
+        return await self._state_store.async_claim_mobile_handoff(token)
+
+    async def async_is_mobile_callback_state(self, state_id: str) -> bool:
+        """Validate a callback state belonging to a claimed mobile handoff."""
+        if self._state_store is None:
+            await self.async_initialize()
+            assert self._state_store is not None
+
+        return await self._state_store.async_is_mobile_callback_state(state_id)
 
     async def async_generate_device_code(self, state_id: str) -> Optional[str]:
         """Generate a device code for the state, used for device login."""
@@ -245,6 +271,23 @@ class OpenIDAuthProvider(AuthProvider):
             state_id, code, self._resolve_ip(ip)
         )
 
+    async def async_get_mobile_login(
+        self, state_id: str, user_data: UserDetails
+    ) -> tuple[str, Credentials] | None:
+        """Consume a mobile state and resolve its HA credentials."""
+        if self._state_store is None:
+            await self.async_initialize()
+            assert self._state_store is not None
+
+        redirect_uri = await self._state_store.async_consume_mobile_state(state_id)
+        if redirect_uri is None:
+            return None
+
+        sub = user_data["sub"]
+        self._user_meta[sub] = user_data
+        credentials = await self.async_get_or_create_credentials({"sub": sub})
+        return redirect_uri, credentials
+
     async def async_get_subject(
         self, state_id: str, ip: str | None = None
     ) -> Optional[str]:
@@ -300,7 +343,7 @@ class OpenIDAuthProvider(AuthProvider):
     # ====
 
     @callback
-    async def async_user_created(self, event) -> None:
+    async def _async_user_created(self, event) -> None:
         """Handle the user created event."""
         user_id = event.data["user_id"]
         user = await self.store.async_get_user(user_id)

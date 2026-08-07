@@ -6,61 +6,92 @@
 {% block content %}
 {% import "_alert.html" as ui %}
 <div class="text-center">
-    {% if code %}
-        <div>
-            <p id="device-instructions">Please login to Home Assistant on another device and enter this code when asked:</p>
-            <div class="mt-4 text-3xl tracking-wide font-medium bg-input border border-divider rounded-lg py-4 px-6 inline-block" id="device-code">
-                {{ code }}
-            </div>
-            <div class="mt-4">
-                {% call ui.alert('info') %}The login will continue automatically when you complete the login on your other device. Please keep the app open.{% endcall %}
-            </div>
-            <!-- Temporarily not shown until https://github.com/christiaangoossens/hass-oidc-auth/issues/300 is picked up -->
-            <!-- Currently sends you to a weird error when clicked before ready -->
-            <!-- <p class="mt-4">
-                <a id="manual-finish-link" href="#" class="text-sm text-muted hover:text-foreground">
-                    Already approved the code, but nothing happened? Click here to continue.
-                </a>
-            </p> -->
+    {% if mobile_auth_url %}
+        <h1 class="mb-4 text-3xl font-normal">Continue sign in</h1>
+        <p class="mb-4 text-sm text-muted">
+            Complete sign-in in your browser. Home Assistant will continue automatically when authentication finishes.
+        </p>
+        <a id="mobile-open-browser" href="#" target="_blank" rel="noopener noreferrer" class="
+            inline-flex items-center justify-center w-full h-10 px-4 bg-primary text-white font-medium leading-none rounded-full
+            transition-colors duration-150 ease-out hover:bg-primary-hover
+            focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus
+        ">
+            Open sign-in page
+        </a>
+        <div id="mobile-waiting-message" class="mt-4">
+            {% call ui.alert('info') %}Keep this page open while signing in.{% endcall %}
         </div>
         <script>
-            const source = new EventSource('/auth/oidc/device-sse');
+            const authUrl = decodeURIComponent("{{ mobile_auth_url }}");
+            const pollToken = "{{ poll_token }}";
+            const openButton = document.getElementById('mobile-open-browser');
+            const message = document.getElementById('mobile-waiting-message');
+            let completed = false;
 
-            function finishLogin() {
-                source.close();
+            openButton.href = authUrl;
 
-                // Perform a POST request to the finish endpoint to complete the login.
-                const form = document.createElement('form');
-                form.method = 'POST';
-                form.action = '/auth/oidc/finish';
-                document.body.appendChild(form);
-                form.submit();
+            async function poll() {
+                if (completed) return;
+
+                try {
+                    const response = await fetch('/auth/oidc/mobile-status', {
+                        method: 'POST',
+                        credentials: 'omit',
+                        cache: 'no-store',
+                        headers: {
+                            'Accept': 'application/json',
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ token: pollToken }),
+                    });
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        if (data.status === 'completed' && data.callback_url) {
+                            completed = true;
+                            window.location.href = data.callback_url;
+                            return;
+                        }
+                    } else if (response.status === 410) {
+                        completed = true;
+                        message.textContent = 'Sign-in expired. Please restart login from the Home Assistant app.';
+                        return;
+                    }
+                } catch (_error) {
+                    // Ignore transient failures while the external browser is active.
+                }
+
+                window.setTimeout(poll, 1000);
             }
 
-            source.addEventListener('ready', finishLogin);
-
-            // No 'error' handler that closes the source: EventSource
-            // reconnects automatically after a dropped connection, e.g.
-            // when the OS suspends this webview while the user enters the
-            // code in their browser (#363). On reconnect, the server
-            // immediately sends 'ready' if the code was approved in the
-            // meantime. Fatal responses (such as a 400 after state expiry)
-            // stop the automatic reconnection on their own.
-
-            // Manual fallback in case the connection cannot be resumed.
-            document.getElementById('manual-finish-link').addEventListener('click', function (event) {
-                event.preventDefault();
-                finishLogin();
-            });
+            // Keep this waiting page in the app WebView and open the actual IdP
+            // authorization URL in a separate browser context.
+            window.open(authUrl, '_blank', 'noopener,noreferrer');
+            poll();
         </script>
+    {% elif mobile_start_url %}
+        <h1 class="mb-4 text-3xl font-normal">Sign in to Home Assistant</h1>
+        <p id="mobile-instructions" class="mb-4 text-sm text-muted">
+            Continue sign-in in your browser, then return to the Home Assistant app.
+        </p>
+        <a id="mobile-login-button" href="{{ mobile_start_url }}" class="
+            inline-flex items-center justify-center w-full h-10 px-4 bg-primary text-white font-medium leading-none rounded-full
+            transition-colors duration-150 ease-out hover:bg-primary-hover
+            focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus
+        ">
+            Continue with {{ name }}
+        </a>
+        <div class="mt-4">
+            {% call ui.alert('info') %}The next page will remain open while sign-in continues in your browser.{% endcall %}
+        </div>
     {% else %}
         <a id="login-button" href="/auth/oidc/redirect" class="
             inline-flex items-center justify-center w-full h-10 px-4 bg-primary text-white font-medium leading-none rounded-full
             transition-colors duration-150 ease-out hover:bg-primary-hover
             focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus
         ">
-                Login with {{ name }}
-            </a>
+            Login with {{ name }}
+        </a>
     {% endif %}
 
     {% if other_link %}
