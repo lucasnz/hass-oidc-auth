@@ -49,6 +49,92 @@ async def test_state_store_generate_and_receive_state(hass: HomeAssistant):
 
 
 @pytest.mark.asyncio
+async def test_state_store_mobile_handoff_is_hashed_and_one_time(
+    hass: HomeAssistant,
+):
+    """A mobile handoff token should be stored hashed and claimed only once."""
+    store_mock = AsyncMock()
+    with patch("homeassistant.helpers.storage.Store", return_value=store_mock):
+        state_store = StateStore(hass)
+        store_mock.async_load.return_value = {}
+        await state_store.async_load()
+
+        state_id = await state_store.async_create_state_from_url(
+            "https://example.com/mobile", TEST_IP, is_mobile=True
+        )
+        token = await state_store.async_generate_mobile_handoff_for_state(state_id)
+        assert token is not None
+        assert state_store.get_data()[state_id]["mobile_handoff_digest"] != token
+        assert state_store.get_data()[state_id]["mobile_handoff_claimed"] is False
+        assert await state_store.async_is_mobile_callback_state(state_id) is False
+        assert (
+            await state_store.async_generate_mobile_handoff_for_state(state_id)
+            is None
+        )
+
+        assert await state_store.async_claim_mobile_handoff(token) == state_id
+        assert state_store.get_data()[state_id]["mobile_handoff_claimed"] is True
+        assert await state_store.async_claim_mobile_handoff(token) is None
+        assert await state_store.async_is_mobile_callback_state(state_id) is True
+
+
+@pytest.mark.asyncio
+async def test_state_store_mobile_state_consumes_claimed_state_without_ip_binding(
+    hass: HomeAssistant,
+):
+    """A claimed mobile state can finish after the app/browser network changes."""
+    store_mock = AsyncMock()
+    with patch("homeassistant.helpers.storage.Store", return_value=store_mock):
+        state_store = StateStore(hass)
+        store_mock.async_load.return_value = {}
+        await state_store.async_load()
+
+        redirect_uri = "https://example.com/auth/authorize?client_id=mobile"
+        state_id = await state_store.async_create_state_from_url(
+            redirect_uri, TEST_IP, is_mobile=True
+        )
+        token = await state_store.async_generate_mobile_handoff_for_state(state_id)
+        assert token is not None
+        assert await state_store.async_claim_mobile_handoff(token) == state_id
+
+        result = await state_store.async_consume_mobile_state(state_id)
+        assert result == redirect_uri
+        assert state_id not in state_store.get_data()
+        assert await state_store.async_consume_mobile_state(state_id) is None
+
+
+@pytest.mark.asyncio
+async def test_state_store_mobile_handoff_rejects_non_mobile_and_expired_states(
+    hass: HomeAssistant,
+):
+    """Only live mobile states may generate or claim a handoff."""
+    store_mock = AsyncMock()
+    with patch("homeassistant.helpers.storage.Store", return_value=store_mock):
+        state_store = StateStore(hass)
+        store_mock.async_load.return_value = {}
+        await state_store.async_load()
+
+        desktop_state = await state_store.async_create_state_from_url(
+            "https://example.com/desktop", TEST_IP
+        )
+        assert (
+            await state_store.async_generate_mobile_handoff_for_state(desktop_state)
+            is None
+        )
+
+        mobile_state = await state_store.async_create_state_from_url(
+            "https://example.com/mobile", TEST_IP, is_mobile=True
+        )
+        token = await state_store.async_generate_mobile_handoff_for_state(mobile_state)
+        assert token is not None
+        state_store.get_data()[mobile_state]["expiration"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+        assert await state_store.async_claim_mobile_handoff(token) is None
+        assert await state_store.async_is_mobile_callback_state(mobile_state) is False
+
+
+@pytest.mark.asyncio
 async def test_state_store_generate_code_and_link_state(hass: HomeAssistant):
     """Test generating a device code and linking another state to it."""
     store_mock = AsyncMock()
@@ -213,6 +299,14 @@ async def test_state_store_data_not_loaded(hass: HomeAssistant):
             await state_store.async_create_state_from_url(
                 "https://example.com", TEST_IP
             )
+        with pytest.raises(RuntimeError):
+            await state_store.async_generate_mobile_handoff_for_state("state")
+        with pytest.raises(RuntimeError):
+            await state_store.async_claim_mobile_handoff("token")
+        with pytest.raises(RuntimeError):
+            await state_store.async_is_mobile_callback_state("state")
+        with pytest.raises(RuntimeError):
+            await state_store.async_consume_mobile_state("state")
         with pytest.raises(RuntimeError):
             await state_store.async_generate_code_for_state("state")
         with pytest.raises(RuntimeError):

@@ -1,7 +1,8 @@
 """State Store, store authentication states (redirect_uri)."""
 
-import secrets
+import hashlib
 import random
+import secrets
 import string
 
 from datetime import datetime, timedelta, timezone
@@ -59,7 +60,9 @@ class StateStore:
             and state["ip_address"] == ip
         )
 
-    async def async_create_state_from_url(self, redirect_uri: str, ip: str) -> str:
+    async def async_create_state_from_url(
+        self, redirect_uri: str, ip: str, is_mobile: bool = False
+    ) -> str:
         """Generates a the OIDC state adds it to the database for 5 minutes."""
         if self._data is None:
             raise RuntimeError("Data not loaded")
@@ -75,10 +78,82 @@ class StateStore:
             "user_details": None,
             "expiration": expiration.isoformat(),
             "ip_address": ip,
+            "is_mobile": is_mobile,
+            "mobile_handoff_digest": None,
+            "mobile_handoff_claimed": False,
         }
 
         await self._async_save()
         return state_id
+
+    async def async_generate_mobile_handoff_for_state(
+        self, state_id: str
+    ) -> Optional[str]:
+        """Generate a short-lived one-time token for opening mobile sign-in."""
+        if self._data is None:
+            raise RuntimeError("Data not loaded")
+
+        state = self._data.get(state_id)
+        if state is None or self._is_expired(state):
+            return None
+        if not state.get("is_mobile", False) or state.get(
+            "mobile_handoff_claimed", False
+        ):
+            return None
+        if state.get("mobile_handoff_digest") is not None:
+            return None
+        if state.get("user_details") is not None:
+            return None
+
+        token = self._generate_id()
+        state["mobile_handoff_digest"] = hashlib.sha256(token.encode()).hexdigest()
+        state["mobile_handoff_claimed"] = False
+        await self._async_save()
+        return token
+
+    async def async_claim_mobile_handoff(self, token: str) -> Optional[str]:
+        """Consume a mobile handoff token and return its state id once."""
+        if self._data is None:
+            raise RuntimeError("Data not loaded")
+
+        token_digest = hashlib.sha256(token.encode()).hexdigest()
+        for state_id, state in self._data.items():
+            stored_digest = state.get("mobile_handoff_digest")
+            if not stored_digest:
+                continue
+            if not secrets.compare_digest(stored_digest, token_digest):
+                continue
+            if not state.get("is_mobile", False) or self._is_expired(state):
+                continue
+            if not state.get("redirect_uri") or state.get("user_details") is not None:
+                continue
+
+            # Claim before the first await so concurrent requests cannot reuse it.
+            state["mobile_handoff_digest"] = None
+            state["mobile_handoff_claimed"] = True
+            await self._async_save()
+            return state_id
+
+        return None
+
+    async def async_is_mobile_callback_state(self, state_id: str) -> bool:
+        """Validate a state presented by the separate mobile browser callback."""
+        if self._data is None:
+            raise RuntimeError("Data not loaded")
+
+        state = self._data.get(state_id)
+        if state is None or self._is_expired(state):
+            return False
+        if not state.get("is_mobile", False):
+            return False
+        if not state.get("mobile_handoff_claimed", False):
+            return False
+        if state.get("mobile_handoff_digest") is not None:
+            return False
+        if state.get("user_details") is not None:
+            return False
+
+        return bool(state.get("redirect_uri"))
 
     async def async_generate_code_for_state(self, state_id: str) -> Optional[str]:
         """Generates a one time code for the state to link device clients."""
@@ -166,6 +241,32 @@ class StateStore:
             await self._async_save()
 
         return False
+
+    async def async_consume_mobile_state(self, state_id: str) -> str | None:
+        """Consume a claimed mobile state without relying on the browser IP."""
+        if self._data is None:
+            raise RuntimeError("Data not loaded")
+
+        state = self._data.get(state_id)
+        if state is None or self._is_expired(state):
+            return None
+        if not state.get("is_mobile", False):
+            return None
+        if not state.get("mobile_handoff_claimed", False):
+            return None
+        if state.get("mobile_handoff_digest") is not None:
+            return None
+
+        redirect_uri = state.get("redirect_uri")
+        if not redirect_uri:
+            return None
+
+        # The one-time handoff and OIDC state/PKCE checks have transferred this
+        # login to the external browser. Do not require its IP to match the app
+        # webview, since mobile networking can legitimately change mid-flow.
+        self._data.pop(state_id)
+        await self._async_save()
+        return redirect_uri
 
     async def async_receive_userinfo_for_state(
         self, state_id: str, ip: str

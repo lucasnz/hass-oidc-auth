@@ -6,3 +6,4 @@ from .injected_auth_page import OIDCInjectedAuthPage as OIDCInjectedAuthPage
 from .redirect import OIDCRedirectView as OIDCRedirectView
 from .welcome import OIDCWelcomeView as OIDCWelcomeView
 from .device_sse import OIDCDeviceSSE as OIDCDeviceSSE
+from .mobile_status import OIDCMobileStatusView as OIDCMobileStatusView
