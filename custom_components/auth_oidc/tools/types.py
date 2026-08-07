@@ -27,6 +27,15 @@ class OIDCState(dict):
     # User friendly device code
     device_code: str | None
 
+    # Whether this state belongs to an iOS/Android app flow
+    is_mobile: bool
+
+    # SHA-256 digest of the one-time token used to open the mobile browser
+    mobile_handoff_digest: str | None
+
+    # Whether the one-time handoff token has already been claimed
+    mobile_handoff_claimed: bool
+
     # The redirect_uri associated with this state,
     # to be able to redirect the user back after authentication
     redirect_uri: str

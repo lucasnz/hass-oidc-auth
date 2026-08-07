@@ -2,6 +2,7 @@
 
 import base64
 import os
+import re
 from collections import OrderedDict
 from urllib.parse import parse_qs, quote, unquote, urlparse, urlencode
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -28,6 +29,7 @@ from custom_components.auth_oidc.endpoints.injected_auth_page import (
 )
 
 MOBILE_CLIENT_ID = "https://home-assistant.io/Android"
+IOS_CLIENT_ID = "https://home-assistant.io/iOS"
 WELCOME_PATH = "/auth/oidc/welcome"
 INJECTION_SCRIPT_MARKER = "<script src='/auth/oidc/static/injection.js"
 
@@ -206,8 +208,9 @@ async def test_welcome_only_adds_store_token_for_web_clients(
 
     captured_redirect_uri = {}
 
-    async def fake_create_state(state_redirect_uri: str, *_args):
+    async def fake_create_state(state_redirect_uri: str, *_args, **kwargs):
         captured_redirect_uri["value"] = state_redirect_uri
+        captured_redirect_uri["is_mobile"] = kwargs.get("is_mobile", False)
         return "state-id"
 
     with (
@@ -216,8 +219,8 @@ async def test_welcome_only_adds_store_token_for_web_clients(
             new=AsyncMock(side_effect=fake_create_state),
         ),
         patch(
-            "custom_components.auth_oidc.provider.OpenIDAuthProvider.async_generate_device_code",
-            new=AsyncMock(return_value="123456"),
+            "custom_components.auth_oidc.provider.OpenIDAuthProvider.async_generate_mobile_handoff",
+            new=AsyncMock(return_value="mobile-token"),
         ),
     ):
         client = await hass_client()
@@ -248,6 +251,7 @@ async def test_welcome_only_adds_store_token_for_web_clients(
 
     if is_mobile:
         assert "https://home-assistant.io/" in nested_redirect_uri
+    assert captured_redirect_uri["is_mobile"] is is_mobile
 
 
 @pytest.mark.asyncio
@@ -277,14 +281,14 @@ async def test_welcome_sets_secure_state_cookie_flags(
 
 
 @pytest.mark.asyncio
-async def test_welcome_mobile_device_code_generation_failure(
+async def test_welcome_mobile_handoff_generation_failure(
     hass: HomeAssistant, hass_client: ClientSessionGenerator
 ):
-    """Welcome should error if device code generation fails for mobile clients."""
+    """Welcome should error if mobile handoff generation fails."""
     await setup(hass)
 
     with patch(
-        "custom_components.auth_oidc.provider.OpenIDAuthProvider.async_generate_device_code",
+        "custom_components.auth_oidc.provider.OpenIDAuthProvider.async_generate_mobile_handoff",
         new=AsyncMock(return_value=None),
     ):
         client = await hass_client()
@@ -297,8 +301,222 @@ async def test_welcome_mobile_device_code_generation_failure(
         )
         assert resp.status == 500
         assert (
-            "Failed to generate device code, please restart login." in await resp.text()
+            "Failed to prepare mobile sign-in, please restart login." in await resp.text()
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_id", [MOBILE_CLIENT_ID, IOS_CLIENT_ID])
+async def test_welcome_mobile_uses_browser_handoff_without_device_code(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator, client_id: str
+):
+    """Both mobile apps should receive the browser handoff page, not a six-digit code."""
+    await setup(hass)
+    client = await hass_client()
+    redirect_uri = create_redirect_uri(client_id)
+    encoded = encode_redirect_uri(redirect_uri)
+
+    resp = await client.get(
+        f"/auth/oidc/welcome?redirect_uri={encoded}", allow_redirects=False
+    )
+
+    assert resp.status == 200
+    text = await resp.text()
+    assert 'id="mobile-login-button"' in text
+    assert "mobile_token=" in text
+    assert 'id="device-code"' not in text
+    assert "/auth/oidc/device-sse" not in text
+    assert "/auth/oidc/mobile-status" not in text
+
+
+@pytest.mark.asyncio
+async def test_mobile_handoff_serves_waiting_page_and_is_one_time(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+):
+    """The handoff should keep a waiting page in HA and open the IdP separately."""
+    await setup(hass)
+    app_client = await hass_client()
+    browser_client = await hass_client()
+    redirect_uri = create_redirect_uri(MOBILE_CLIENT_ID)
+    encoded = encode_redirect_uri(redirect_uri)
+
+    resp_welcome = await app_client.get(
+        f"/auth/oidc/welcome?redirect_uri={encoded}", allow_redirects=False
+    )
+    text = await resp_welcome.text()
+    match = re.search(r'href="([^"]*mobile_token=[^"]+)"', text)
+    assert match is not None
+    parsed_start = urlparse(match.group(1))
+    mobile_start_path = f"{parsed_start.path}?{parsed_start.query}"
+
+    with patch(
+        "custom_components.auth_oidc.tools.oidc_client.OIDCClient.async_get_authorization_url",
+        new=AsyncMock(return_value="https://idp.example/authorize?state=test"),
+    ):
+        resp = await browser_client.get(mobile_start_path, allow_redirects=False)
+
+    assert resp.status == 200
+    waiting_text = await resp.text()
+    assert "Continue sign in" in waiting_text
+    assert "window.open(authUrl, '_blank'" in waiting_text
+    assert "/auth/oidc/mobile-status" in waiting_text
+    assert 'const pollToken = "' in waiting_text
+    assert "https%3A//idp.example/authorize%3Fstate%3Dtest" in waiting_text
+    assert "auth_oidc_mobile_state" not in resp.cookies
+    assert resp.headers["Cache-Control"] == "no-store"
+    assert resp.headers["Referrer-Policy"] == "no-referrer"
+
+    # The same handoff URL cannot be claimed by another browser.
+    second_browser = await hass_client()
+    replay = await second_browser.get(mobile_start_path, allow_redirects=False)
+    assert replay.status == 400
+    assert "Invalid or expired mobile sign-in link" in await replay.text()
+
+
+@pytest.mark.asyncio
+async def test_mobile_status_reports_pending_and_rejects_unknown_token(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+):
+    """Mobile status should use a separate high-entropy token, not app cookies."""
+    await setup(hass)
+    app_client = await hass_client()
+    redirect_uri = create_redirect_uri(MOBILE_CLIENT_ID)
+    encoded = encode_redirect_uri(redirect_uri)
+
+    welcome = await app_client.get(
+        f"/auth/oidc/welcome?redirect_uri={encoded}", allow_redirects=False
+    )
+    text = await welcome.text()
+    match = re.search(r'href="([^"]*mobile_token=[^"]+)"', text)
+    assert match is not None
+    parsed_start = urlparse(match.group(1))
+
+    with patch(
+        "custom_components.auth_oidc.tools.oidc_client.OIDCClient.async_get_authorization_url",
+        new=AsyncMock(return_value="https://idp.example/authorize"),
+    ):
+        waiting = await app_client.get(
+            f"{parsed_start.path}?{parsed_start.query}", allow_redirects=False
+        )
+
+    waiting_text = await waiting.text()
+    token_match = re.search(r'const pollToken = "([^"]+)";', waiting_text)
+    assert token_match is not None
+    poll_token = token_match.group(1)
+
+    # Status is token-bound and deliberately does not rely on the state cookie.
+    app_client.session.cookie_jar.clear()
+    pending = await app_client.post(
+        "/auth/oidc/mobile-status", json={"token": poll_token}
+    )
+    assert pending.status == 200
+    assert await pending.json() == {"status": "pending"}
+
+    invalid = await app_client.post(
+        "/auth/oidc/mobile-status", json={"token": "not-the-token"}
+    )
+    assert invalid.status == 410
+    assert await invalid.json() == {"status": "expired"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_id", [MOBILE_CLIENT_ID, IOS_CLIENT_ID])
+async def test_mobile_callback_prepares_final_companion_app_callback(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    client_id: str,
+):
+    """Browser callback should prepare the final HA code for Android and iOS."""
+    await setup(hass)
+    app_client = await hass_client()
+    browser_client = await hass_client()
+    redirect_uri = create_redirect_uri(client_id)
+    encoded = encode_redirect_uri(redirect_uri)
+
+    welcome = await app_client.get(
+        f"/auth/oidc/welcome?redirect_uri={encoded}", allow_redirects=False
+    )
+    state = welcome.cookies["auth_oidc_state"].value
+    welcome_text = await welcome.text()
+    match = re.search(r'href="([^"]*mobile_token=[^"]+)"', welcome_text)
+    assert match is not None
+    parsed_start = urlparse(match.group(1))
+
+    with patch(
+        "custom_components.auth_oidc.tools.oidc_client.OIDCClient.async_get_authorization_url",
+        new=AsyncMock(return_value="https://idp.example/authorize"),
+    ):
+        waiting = await app_client.get(
+            f"{parsed_start.path}?{parsed_start.query}", allow_redirects=False
+        )
+    waiting_text = await waiting.text()
+    token_match = re.search(r'const pollToken = "([^"]+)";', waiting_text)
+    assert token_match is not None
+    poll_token = token_match.group(1)
+
+    user_details = {
+        "sub": "mobile-user",
+        "display_name": "Mobile User",
+        "username": "mobile",
+        "role": "system-users",
+    }
+    with (
+        patch(
+            "custom_components.auth_oidc.tools.oidc_client.OIDCClient.async_complete_token_flow",
+            new=AsyncMock(return_value=user_details),
+        ),
+        patch(
+            "custom_components.auth_oidc.tools.helpers.indieauth.verify_client_id",
+            return_value=True,
+        ),
+        patch(
+            "custom_components.auth_oidc.tools.helpers.indieauth.verify_redirect_uri",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "custom_components.auth_oidc.tools.helpers.process_success_login"
+        ),
+        patch(
+            "custom_components.auth_oidc.tools.helpers.create_auth_code",
+            return_value="ha-auth-code",
+        ),
+    ):
+        callback_resp = await browser_client.get(
+            f"/auth/oidc/callback?code=idp-code&state={state}",
+            allow_redirects=False,
+        )
+
+    assert callback_resp.status == 200
+    callback_text = await callback_resp.text()
+    assert "Sign in completed" in callback_text
+    assert "ha-auth-code" not in callback_text
+    assert "idp-code" not in callback_text
+    assert callback_resp.headers["Cache-Control"] == "no-store"
+
+    # Any client holding the separate poll secret can retrieve the result once;
+    # no browser/app cookie continuity is required.
+    app_client.session.cookie_jar.clear()
+    completed = await app_client.post(
+        "/auth/oidc/mobile-status", json={"token": poll_token}
+    )
+    assert completed.status == 200
+    payload = await completed.json()
+    assert payload["status"] == "completed"
+
+    final_callback = urlparse(payload["callback_url"])
+    expected = urlparse(client_id)
+    assert final_callback.scheme == expected.scheme
+    assert final_callback.netloc == expected.netloc
+    assert final_callback.path == expected.path
+    callback_query = parse_qs(final_callback.query)
+    assert callback_query["code"] == ["ha-auth-code"]
+    assert callback_query["state"] == ["example"]
+
+    # Completed callbacks are one-time and are removed from the in-memory store.
+    replay = await app_client.post(
+        "/auth/oidc/mobile-status", json={"token": poll_token}
+    )
+    assert replay.status == 410
 
 
 @pytest.mark.asyncio
@@ -612,6 +830,29 @@ async def test_finish_post_rejects_invalid_state(
         resp = await client.post("/auth/oidc/finish", allow_redirects=False)
         assert resp.status == 400
         assert "Invalid state, please restart login." in await resp.text()
+
+
+@pytest.mark.asyncio
+async def test_device_status_poll_reports_waiting(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+):
+    """One-shot mobile status poll should report an unfinished state."""
+    await setup(hass)
+    client = await hass_client()
+    redirect_uri = create_redirect_uri(MOBILE_CLIENT_ID)
+    encoded = encode_redirect_uri(redirect_uri)
+    resp_welcome = await client.get(
+        f"/auth/oidc/welcome?redirect_uri={encoded}", allow_redirects=False
+    )
+    assert resp_welcome.status == 200
+
+    resp = await client.get(
+        "/auth/oidc/device-sse?poll=1", allow_redirects=False
+    )
+
+    assert resp.status == 200
+    assert await resp.json() == {"ready": False}
+    assert resp.headers["Cache-Control"] == "no-store"
 
 
 @pytest.mark.asyncio
